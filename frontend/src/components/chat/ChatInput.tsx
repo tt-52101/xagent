@@ -3,7 +3,7 @@ import { createFileChipHTML } from "./FileChip";
 import { useRouter } from "next/navigation";
 import { Paperclip, X, File as FileIcon, Sparkles, Pause, Play, Loader2, ArrowUp, Globe } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { cn, getApiUrl } from "@/lib/utils";
+import { cn, getApiUrl, getUploadApiUrl } from "@/lib/utils";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
 import { ConfigDialog } from "@/components/config-dialog";
@@ -32,7 +32,7 @@ interface ChatInputProps {
   onModeChange?: (mode: "task" | "process") => void;
   inputValue?: string;
   onInputChange?: (value: string) => void;
-  taskStatus?: "pending" | "running" | "completed" | "failed" | "paused";
+  taskStatus?: "pending" | "running" | "completed" | "failed" | "paused" | "waiting_for_user";
   onPause?: () => void;
   onResume?: () => void;
   taskConfig?: {
@@ -271,7 +271,7 @@ export function ChatInput({
         // Default to task mode if not specified
         formData.append('task_type', mode || 'task');
 
-        const response = await apiRequest(`${getApiUrl()}/api/files/upload`, {
+        const response = await apiRequest(`${getUploadApiUrl()}/api/files/upload`, {
           method: 'POST',
           body: formData,
           signal: controller.signal
@@ -411,6 +411,11 @@ export function ChatInput({
     const isUploadingFiles = uploadingFiles.size > 0;
     return (hasText || hasFiles) && !isLoading && !isUploadingFiles;
   };
+  const canPauseTask =
+    taskStatus === 'running' ||
+    (isLoading &&
+      !!onPause &&
+      !['completed', 'failed', 'paused', 'waiting_for_user'].includes(taskStatus || ''));
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -767,7 +772,7 @@ export function ChatInput({
               </div>
 
               <div className="flex items-center gap-3">
-                {taskStatus === 'running' ? (
+                {canPauseTask ? (
                   <Button
                     type="button"
                     size="icon"

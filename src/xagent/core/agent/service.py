@@ -48,6 +48,7 @@ class AgentService:
         vision_llm: Optional[BaseLLM] = None,
         compact_llm: Optional[BaseLLM] = None,
         memory_similarity_threshold: Optional[float] = None,
+        memory_enabled: bool = True,
         tool_config: Optional[Any] = None,
         agent_type: str = "standard",
         system_prompt: Optional[str] = None,
@@ -99,6 +100,7 @@ class AgentService:
             compact_llm.model_name if compact_llm else None,
         )
         self.memory_similarity_threshold = memory_similarity_threshold
+        self.memory_enabled = memory_enabled
         self.allowed_skills = self._get_allowed_skills_from_config(tool_config)
         if self.allowed_skills:
             logger.info(f"Allowed skills configured: {self.allowed_skills}")
@@ -614,6 +616,12 @@ class AgentService:
         if self._v2_adapter is not None:
             self._v2_adapter.config.outbound_message_handler = handler
 
+    def set_allowed_skills(self, allowed_skills: Optional[List[str]]) -> None:
+        """Set the skill allow-list and propagate it to a cached v2 adapter."""
+        self.allowed_skills = allowed_skills
+        if self._v2_adapter is not None:
+            self._v2_adapter.config.allowed_skills = allowed_skills
+
     def supports_v2_control(self) -> bool:
         return self.agent_runtime == "v2"
 
@@ -951,7 +959,7 @@ class AgentService:
                 conversation_history=self._conversation_history,
                 execution_context_messages=self._execution_context_messages,
                 recovered_skill_context=self._recovered_skill_context,
-                memory_store=self.memory,
+                memory_store=self.memory if self.memory_enabled else None,
                 memory_similarity_threshold=self.memory_similarity_threshold,
                 allowed_skills=self.allowed_skills,
             )

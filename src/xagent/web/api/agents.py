@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from ...config import get_agent_pattern_for_execution_mode, get_uploads_dir
 from ...core.agent.service import AgentService
 from ...core.memory.in_memory import InMemoryMemoryStore
+from ...core.tools.core.document_search import find_missing_knowledge_bases
 from ...core.tracing import create_agent_tracer
 from ...core.utils.type_check import ensure_list
 from ..auth_dependencies import get_current_user
@@ -159,7 +160,12 @@ def enhance_system_prompt_with_kb(
         f"\n\nAvailable knowledge bases: {kb_list}. "
         "These knowledge bases are already selected. "
         "Do not call list_knowledge_bases to discover them; "
-        "use knowledge_search directly for answers."
+        "use knowledge_search directly for answers. "
+        "For specific how-to or factual questions, start with one targeted "
+        "knowledge_search, inspect all returned results as one evidence set, "
+        "and answer from that evidence when it is relevant. Search again only "
+        "when the returned results as a group are missing the information "
+        "needed to answer the current question."
     )
 
     if system_prompt:
@@ -178,6 +184,25 @@ def _validate_knowledge_base_tools(
         raise HTTPException(
             status_code=400,
             detail="Knowledge bases are selected but the Knowledge tool category is not enabled. Please enable the Knowledge tools before saving.",
+        )
+
+
+async def _validate_knowledge_bases_exist(
+    knowledge_bases: List[str], current_user: User
+) -> None:
+    """Raise HTTPException if any selected knowledge base is not visible to the user."""
+    missing = await find_missing_knowledge_bases(
+        knowledge_bases,
+        user_id=int(current_user.id),
+        is_admin=bool(current_user.is_admin),
+    )
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Knowledge base(s) not found or not visible to this user: "
+                + ", ".join(missing)
+            ),
         )
 
 
@@ -348,6 +373,7 @@ async def create_agent(
         _validate_knowledge_base_tools(
             agent_data.knowledge_bases, agent_data.tool_categories
         )
+        await _validate_knowledge_bases_exist(agent_data.knowledge_bases, current_user)
 
         # Create agent
         agent = Agent(
@@ -481,6 +507,7 @@ async def update_agent(
             else (agent.tool_categories or [])
         )
         _validate_knowledge_base_tools(effective_kb, effective_tools)  # type: ignore[arg-type]
+        await _validate_knowledge_bases_exist(effective_kb, current_user)  # type: ignore[arg-type]
 
         # Update fields
         if agent_data.name is not None:
@@ -842,6 +869,11 @@ async def preview_agent(
             },
         )
 
+        enhanced_system_prompt = enhance_system_prompt_with_kb(
+            request.instructions if request.instructions else None,
+            request.knowledge_bases if request.knowledge_bases is not None else None,
+        )
+
         # Create agent service (Langfuse only, no database/websocket logging)
         memory = InMemoryMemoryStore()
         agent_service = AgentService(
@@ -858,16 +890,14 @@ async def preview_agent(
             workspace_base_dir=str(get_uploads_dir() / "preview"),
             task_id=preview_task_id,  # Add task_id for proper tool initialization
             tracer=tracer,
+            system_prompt=enhanced_system_prompt,
+            memory_enabled=False,
         )
 
         # Execute task with system prompt in context
         execution_context = {}
-        if request.instructions:
-            execution_context["system_prompt"] = request.instructions
-        execution_context["system_prompt"] = enhance_system_prompt_with_kb(  # type: ignore[assignment]
-            execution_context.get("system_prompt"),
-            request.knowledge_bases if request.knowledge_bases is not None else None,
-        )
+        if enhanced_system_prompt:
+            execution_context["system_prompt"] = enhanced_system_prompt
 
         with UserContext(int(current_user.id)):
             result = await agent_service.execute_task(

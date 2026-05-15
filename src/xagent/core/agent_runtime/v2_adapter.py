@@ -252,7 +252,7 @@ class AgentV2ExecutionAdapter:
             )
         if self.config.pattern == "single_call":
             return (
-                V2ReActPattern(max_iterations=1, tool_choice="none"),
+                V2ReActPattern(max_iterations=2, finalize_after_tool_result=True),
                 "agent_v2_single_call",
             )
         return V2ReActPattern(), "agent_v2_react"
@@ -280,11 +280,13 @@ class AgentV2ExecutionAdapter:
         execution_id: str,
     ) -> dict[str, Any]:
         output = result.get("output", result.get("response", result.get("error")))
+        if not output:
+            output = self._latest_assistant_message(result.get("context"))
         status = result.get(
             "status",
             "completed" if result.get("success") else "failed",
         )
-        return {
+        normalized = {
             "status": status,
             "output": output or "No output provided",
             "success": result.get("success", False),
@@ -298,3 +300,32 @@ class AgentV2ExecutionAdapter:
             },
             "agent_v2_result": result,
         }
+        if status == "waiting_for_user":
+            message = str(result.get("message") or output or "")
+            interactions = result.get("interactions")
+            normalized.update(
+                {
+                    "message": message,
+                    "message_type": result.get("message_type", "question"),
+                    "interactions": interactions,
+                    "chat_response": {
+                        "message": message,
+                        "interactions": interactions
+                        if isinstance(interactions, list)
+                        else [],
+                    },
+                }
+            )
+        return normalized
+
+    def _latest_assistant_message(self, context: Any) -> str | None:
+        messages = getattr(context, "messages", None)
+        if not isinstance(messages, list):
+            return None
+        for message in reversed(messages):
+            if getattr(message, "role", None) != "assistant":
+                continue
+            content = getattr(message, "content", None)
+            if isinstance(content, str) and content:
+                return content
+        return None

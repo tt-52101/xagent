@@ -4,9 +4,11 @@ import asyncio
 import json
 import logging
 import re
+import shutil
 import unicodedata
 import uuid
-from datetime import datetime, timezone
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, cast
 from urllib.parse import unquote
@@ -32,7 +34,7 @@ from ...config import (
 from ...core.agent.trace import TraceEvent, TraceHandler
 from ..auth_dependencies import get_user_from_websocket_token
 from ..models.database import get_db
-from ..models.task import Task
+from ..models.task import Task, TaskStatus
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from ..services.chat_history_service import get_latest_waiting_question
@@ -1287,8 +1289,6 @@ class SharedWebSocketTracer(TraceHandler):
 
     def _serialize_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Recursively serialize data to ensure JSON compatibility."""
-        import json
-        from datetime import datetime, timezone
 
         def clean_string(value: str) -> str:
             if not isinstance(value, str):
@@ -1539,10 +1539,54 @@ async def handle_file_upload_for_task(
                 original_file_name = Path(file_name).name
                 normalized_file_name = normalize_filename(original_file_name)
 
-                # Do not copy file to workspace input directory to avoid duplication
-                # Use the user directory file directly
+                # Keep the real file in the user-level uploads dir, but expose
+                # a symlink inside the task workspace's input/ directory so
+                # the agent's `list_files` tool can see it without needing
+                # additional tool calls. Without this link, `list_files`
+                # returns an empty workspace and the agent often gives up
+                # before falling back to `list_all_user_files`.
                 target_path = source_path
                 uploaded_files.append(str(target_path))
+
+                workspace_link_path: Path | None = None
+                if agent_service.workspace:
+                    try:
+                        input_dir = Path(agent_service.workspace.input_dir)
+                        input_dir.mkdir(parents=True, exist_ok=True)
+                        candidate = input_dir / normalized_file_name
+                        # If something with the same name already exists in
+                        # input/, give the link a unique numeric suffix.
+                        suffix_idx = 1
+                        stem, ext = candidate.stem, candidate.suffix
+                        while candidate.exists() or candidate.is_symlink():
+                            try:
+                                if candidate.resolve() == source_path.resolve():
+                                    break  # already pointing at the right file
+                            except OSError:
+                                pass
+                            candidate = input_dir / f"{stem}_{suffix_idx}{ext}"
+                            suffix_idx += 1
+                        if not (candidate.exists() or candidate.is_symlink()):
+                            try:
+                                candidate.symlink_to(source_path.resolve())
+                                workspace_link_path = candidate
+                            except OSError as link_err:
+                                # Fall back to copy when symlinks aren't
+                                # supported (e.g. some Windows configs).
+                                logger.warning(
+                                    f"symlink failed ({link_err}); copying "
+                                    f"{source_path.name} into workspace"
+                                )
+
+                                shutil.copy2(source_path, candidate)
+                                workspace_link_path = candidate
+                        else:
+                            workspace_link_path = candidate
+                    except Exception as link_err:  # noqa: BLE001
+                        logger.warning(
+                            f"Could not expose {source_path.name} in task "
+                            f"workspace input/: {link_err}"
+                        )
 
                 if file_record.task_id is None:
                     file_record.task_id = task_id
@@ -1550,8 +1594,11 @@ async def handle_file_upload_for_task(
                 db.flush()
 
                 if agent_service.workspace:
+                    # Pass absolute path so resolve_path() in register_file
+                    # doesn't mistake a CWD-relative storage_path for a
+                    # workspace-relative one (looking under output/...).
                     agent_service.workspace.register_file(
-                        str(target_path),
+                        str(target_path.resolve()),
                         file_id=str(file_record.file_id),
                         db_session=db,
                     )
@@ -1565,11 +1612,16 @@ async def handle_file_upload_for_task(
                         "size": file_size,
                         "type": file_type,
                         "path": str(target_path),
+                        "workspace_path": (
+                            str(workspace_link_path) if workspace_link_path else None
+                        ),
                     }
                 )
 
                 logger.info(
-                    f"File added to workspace without copying: {target_path} (original: {original_file_name} -> normalized: {normalized_file_name})"
+                    f"File registered: storage={target_path} "
+                    f"input_link={workspace_link_path} "
+                    f"(original={original_file_name} normalized={normalized_file_name})"
                 )
 
             except Exception as e:
@@ -1627,6 +1679,48 @@ async def handle_chat_message(
         files = message_data.get("files", [])
         user = message_data.get("user")
 
+        # Race-condition fallback: when the message arrives without `files`
+        # in its payload, the frontend may still have uploaded files via the
+        # HTTP /api/files/upload endpoint a moment earlier. Look those up in
+        # the DB and treat them as if they had been declared inline. This
+        # fixes the task-36 scenario where the agent's first turn answered
+        # "I don't see any documents" despite a successful HTTP upload.
+        if not files and user is not None:
+            try:
+                with closing(get_db()) as _db_iter:
+                    _db: Session = next(_db_iter)
+                    cutoff = datetime.now(timezone.utc).replace(
+                        tzinfo=None
+                    ) - timedelta(minutes=5)
+                    pending = (
+                        _db.query(UploadedFile)
+                        .filter(
+                            UploadedFile.user_id == int(user.id),
+                            UploadedFile.task_id == int(task_id),
+                            UploadedFile.created_at >= cutoff,
+                        )
+                        .order_by(UploadedFile.created_at.desc())
+                        .all()
+                    )
+                    if pending:
+                        files = [
+                            {
+                                "file_id": str(record.file_id),
+                                "name": str(record.filename),
+                                "size": int(record.file_size or 0),
+                                "type": record.mime_type,
+                            }
+                            for record in pending
+                        ]
+                        logger.info(
+                            f"📁 Race fallback: recovered {len(files)} "
+                            f"uploaded file(s) from DB for task {task_id}"
+                        )
+            except Exception as _e:  # noqa: BLE001
+                logger.warning(
+                    f"Race fallback file lookup failed for task {task_id}: {_e}"
+                )
+
         logger.info(f"Received chat message for task {task_id}")
         logger.info(f"👤 User: {user.id if user else 'unknown'}")
         logger.info(f"📄 Message: {user_message}")
@@ -1638,10 +1732,6 @@ async def handle_chat_message(
 
         # Call Agent to handle - use same agent manager as chat API
         try:
-            from sqlalchemy.orm import Session
-
-            from ..models.database import get_db
-            from ..models.task import Task, TaskStatus
             from ..services.chat_history_service import (
                 load_task_transcript,
                 persist_user_message,
@@ -2540,7 +2630,7 @@ async def send_historical_data_as_stream(
                     if isinstance(content, str) and content.strip():
                         if trace_event.event_type == "user_message":
                             trace_message_keys.add(("user", content.strip()))
-                        elif trace_event.event_type == "agent_message":
+                        elif trace_event.event_type in {"agent_message", "ai_message"}:
                             trace_message_keys.add(("assistant", content.strip()))
 
             for trace_event in trace_events:
@@ -3166,7 +3256,9 @@ async def handle_builder_chat(
     import uuid
 
     from ...core.agent.service import AgentService
+    from ...core.agent_v2.context.enrichment import build_skill_context
     from ...core.memory.in_memory import InMemoryMemoryStore
+    from ...skills.utils import create_skill_manager
     from ..models.database import get_db
     from ..services.llm_utils import UserAwareModelStorage
 
@@ -3240,36 +3332,21 @@ async def handle_builder_chat(
             "execution_mode": message_data.get("executionMode", "balanced"),
         }
 
-        # Build system prompt with context
-        system_prompt = f"""You are an expert AI Agent Builder Assistant.
-Your job is to help users create and configure custom AI agents.
+        skill_manager = create_skill_manager()
+        agent_builder_skill = await skill_manager.get_skill("agent-builder")
+        agent_builder_skill_context = (
+            build_skill_context(agent_builder_skill) if agent_builder_skill else None
+        )
+
+        # Build system prompt with runtime state only. The behavioral workflow comes
+        # from the forced agent-builder skill context below.
+        system_prompt = f"""You are the runtime wrapper for the Xagent builder chat.
+Follow the selected `agent-builder` skill as the authoritative workflow.
 
 Current Agent Configuration:
 {current_config}
 
-When the user describes what they want to build, use the create_agent or update_agent tool to help them.
-The agent will be updated immediately and can be used right away.
-
-Important instructions:
-1. Always create/update agents with clear, descriptive names and detailed descriptions
-2. The description should explain WHEN to use this agent (e.g., "Use this agent for data analysis tasks involving CSV files")
-3. Include appropriate tool_categories and skills based on the user's requirements
-4. After creating or updating an agent, present it to the user in a clear format with the markdown link
-5. When updating an agent, if you need to modify tools, skills, or knowledge bases, you MUST provide the FULL updated list in your tool call (combining the existing ones from Current Agent Configuration with any new ones the user requested). If you do not include the existing ones, they will be removed!
-6. If the user asks to build an agent that requires a knowledge base (e.g., answering questions from a specific website, document, FAQ, or company domain), ALWAYS check if a relevant knowledge base exists using `list_knowledge_bases` BEFORE deciding whether to create a new one.
-   - If the agent is meant to be an FAQ bot, customer service bot, or answer specific organizational questions, it ABSOLUTELY REQUIRES a knowledge base. Do NOT assume it can answer from general knowledge.
-   - If the user HAS provided a URL: Do NOT ask the user again, but you STILL MUST call `list_knowledge_bases` first to see whether a relevant knowledge base already exists for that website/domain.
-   - Only if no relevant knowledge base exists after checking `list_knowledge_bases`, you MUST use the `create_knowledge_base_from_url` tool to import the website, and then proceed to create or update the agent with the appropriate knowledge base.
-   - If the user HAS NOT provided a URL or file: You MUST STOP and ask the user for clarification using the `ask_user_question` tool to request them to upload a file or provide a URL. Use the "action_cards" interaction type ONLY for high-level actions like "Import Website" and "Upload File". If you know the user's intended website URL but it hasn't been crawled yet, you MUST pass that URL into the "default_value" field of the interaction. For selecting from a list of existing items (like existing knowledge bases), you MUST use the "select_one" interaction type instead. When using "action_cards" for knowledge base, provide two options: one with `action_type="input_url"` and another with `action_type="upload"`.
-     CRITICAL INSTRUCTION: You MUST set your DECISION JSON type to "tool_call" to invoke `ask_user_question`. Your text reasoning should explain why you are asking the user. The system will then prompt you to generate the native tool call parameters. Do NOT include the "message" or "interactions" in your DECISION JSON block.
-   - Do NOT proceed to create or update the agent until the knowledge base is ready.
-
-File upload handling:
-- When the user uploads files, their file_ids will be provided in the message context under "uploaded_file_ids".
-- If file_ids are present, you MUST IMMEDIATELY call `create_knowledge_base_from_file` with those file_ids to create the knowledge base.
-- Do NOT ask the user to upload again if file_ids are already provided.
-
-You have access to the following tools:
+Builder chat tools available in this runtime:
 - create_agent: Create a new agent with specific capabilities
 - update_agent: Update an existing agent with specific capabilities
 - list_available_skills: Query the list of skills you can assign to an agent
@@ -3279,11 +3356,32 @@ You have access to the following tools:
 - create_knowledge_base_from_url: Create a knowledge base by crawling a given website URL (use this automatically if the user provided a URL)
 - create_knowledge_base_from_file: Create a knowledge base from already-uploaded files using their file_ids (use this when the user has uploaded files)
 
-Use the create_agent tool whenever the user wants to build a new agent and there is no agent ID in the current configuration.
-CRITICAL: Always use the user's ORIGINAL requirements (name, role, instructions, etc.) from earlier in the conversation. Do NOT generate generic names like "FAQ Bot" or "Data Q&A Agent"!
-Use the update_agent tool whenever the user wants to modify their current agent configuration and an agent ID is available in the current configuration.
-If the user wants to add skills, tool categories, or knowledge bases but you are unsure which ones exist, use the list_* tools to find out before calling create_agent or update_agent.
+Use native `ask_user_question` for structured user input. Do not ask required
+clarification questions as plain assistant text.
 """
+
+        async def send_builder_outbound_message(payload: Dict[str, Any]) -> None:
+            """Bridge agent_v2 agent-to-user messages to the builder chat socket."""
+            await websocket.send_text(
+                json.dumps(
+                    create_stream_event(
+                        "agent_message",
+                        builder_task_id,
+                        {
+                            "event_id": payload.get("event_id"),
+                            "step_id": payload.get("step_id"),
+                            "execution_id": payload.get("execution_id"),
+                            "message": payload.get("message"),
+                            "message_type": payload.get("message_type", "info"),
+                            "expect_response": bool(
+                                payload.get("expect_response", False)
+                            ),
+                            "metadata": payload.get("metadata") or {},
+                            "agent_runtime": "v2",
+                        },
+                    )
+                )
+            )
 
         # Get LLM configuration
         model_name = current_config.get("model")
@@ -3328,7 +3426,6 @@ If the user wants to add skills, tool categories, or knowledge bases but you are
                 ListToolCategoriesTool,
                 UpdateAgentTool,
             )
-            from ...core.tools.adapters.vibe.ask_user_tool import AskUserQuestionTool
             from ...core.tools.adapters.vibe.document_search import (
                 ListKnowledgeBasesTool,
             )
@@ -3357,7 +3454,6 @@ If the user wants to add skills, tool categories, or knowledge bases but you are
             list_kbs_tool = ListKnowledgeBasesTool(
                 user_id=int(user.id), is_admin=bool(user.is_admin)
             )
-            ask_user_question_tool = AskUserQuestionTool()
             create_kb_url_tool = CreateKnowledgeBaseFromUrlTool(
                 user_id=int(user.id), is_admin=bool(user.is_admin)
             )
@@ -3386,11 +3482,11 @@ If the user wants to add skills, tool categories, or knowledge bases but you are
                     list_skills_tool,
                     list_tool_categories_tool,
                     list_kbs_tool,
-                    ask_user_question_tool,
                     create_kb_url_tool,
                     create_kb_file_tool,
                 ],
-                use_dag_pattern=False,  # Use ReAct pattern
+                pattern="react",
+                agent_runtime="v2",
                 id=builder_task_id,
                 enable_workspace=True,
                 workspace_base_dir=str(get_uploads_dir() / "builder_chat"),
@@ -3399,13 +3495,21 @@ If the user wants to add skills, tool categories, or knowledge bases but you are
                 tracer=builder_tracer,  # Using common websocket tracer
             )
 
-            # Save agent service to websocket state for reuse
+            # Save agent service to websocket state for reuse. Builder chat has a
+            # fixed product workflow: force the agent-builder skill and do not
+            # allow generic skill auto-selection to choose anything else.
+            agent_service.set_allowed_skills(["agent-builder"])
+            agent_service.set_recovered_skill_context(agent_builder_skill_context)
+            agent_service.set_outbound_message_handler(send_builder_outbound_message)
             websocket.state.builder_agent_service = agent_service
             logger.info(
                 f"Created new builder chat agent service with task_id: {builder_task_id}"
             )
         else:
             agent_service = websocket.state.builder_agent_service
+            agent_service.set_allowed_skills(["agent-builder"])
+            agent_service.set_recovered_skill_context(agent_builder_skill_context)
+            agent_service.set_outbound_message_handler(send_builder_outbound_message)
             # Update tracer to the new connection
             agent_service.tracer = builder_tracer
             # Defensive initialization for service reuse
@@ -3445,6 +3549,13 @@ If the user wants to add skills, tool categories, or knowledge bases but you are
                     context=execution_context,
                     task_id=builder_task_id,
                 )
+
+            if result.get("status") == "waiting_for_user":
+                result["chat_response"] = {
+                    "message": result.get("message", ""),
+                    "interactions": result.get("interactions", []),
+                }
+                result.setdefault("output", result.get("message", ""))
 
             # Append interaction to chat history
             if hasattr(websocket.state, "builder_chat_history"):
@@ -3924,6 +4035,13 @@ async def handle_build_preview_execution(
                     f"Preview is for published agent {preview_agent.id} ({preview_agent.name}), will exclude from agent tools"
                 )
 
+        # Execute task
+        from .agents import enhance_system_prompt_with_kb
+
+        enhanced_system_prompt = enhance_system_prompt_with_kb(
+            instructions or None, knowledge_bases
+        )
+
         # Determine execution mode and map to pattern.
         pattern = get_agent_pattern_for_execution_mode(execution_mode)
 
@@ -3959,6 +4077,8 @@ async def handle_build_preview_execution(
             allowed_external_dirs=allowed_external_dirs,
             task_id=preview_task_id,
             tracer=preview_tracer,
+            system_prompt=enhanced_system_prompt,
+            memory_enabled=False,
         )
 
         # Save agent service to websocket state for pause functionality
@@ -4028,8 +4148,11 @@ async def handle_build_preview_execution(
                         uploaded_files.append(str(target_path))
 
                         if agent_service.workspace:
+                            # Pass absolute path — resolve_path() else mistakes
+                            # CWD-relative for workspace-relative.
                             agent_service.workspace.register_file(
-                                str(target_path), file_id=str(file_record.file_id)
+                                str(target_path.resolve()),
+                                file_id=str(file_record.file_id),
                             )
 
                         file_info_list.append(
@@ -4084,22 +4207,15 @@ async def handle_build_preview_execution(
                 )
                 return
 
-        # Execute task
-        from .agents import enhance_system_prompt_with_kb
-
-        execution_context = {}
-        if instructions:
-            execution_context["system_prompt"] = instructions
+        execution_context: dict[str, Any] = {}
+        if enhanced_system_prompt:
+            execution_context["system_prompt"] = enhanced_system_prompt
         if file_prompt:
             if user_message:
                 user_message = f"{user_message}\n\n{file_prompt}"
             else:
                 user_message = file_prompt
 
-        # Emphasize KB priority when knowledge bases are configured
-        execution_context["system_prompt"] = enhance_system_prompt_with_kb(
-            execution_context.get("system_prompt"), knowledge_bases
-        )
         if uploaded_files:
             execution_context["uploaded_files"] = uploaded_files
         if file_info_list:
