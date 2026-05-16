@@ -22,6 +22,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import RedirectResponse
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from ...config import (
@@ -191,6 +192,87 @@ def _append_uploaded_files_context_to_message(
     if uploaded_files_context in message:
         return message
     return f"{message.rstrip()}\n\n{uploaded_files_context}"
+
+
+def _display_message_for_user(user_message: str, has_files: bool) -> str:
+    """Return the user-visible message for chat history and trace events."""
+    if user_message.strip():
+        return user_message
+    if has_files:
+        return "Uploaded file(s)"
+    return user_message
+
+
+def _selected_file_ids_from_task_config(task: Any) -> list[str]:
+    """Return unique selected file ids stored during task creation."""
+    agent_config = getattr(task, "agent_config", None)
+    if not isinstance(agent_config, dict):
+        return []
+
+    raw_file_ids = agent_config.get("selected_file_ids")
+    if not isinstance(raw_file_ids, list):
+        return []
+
+    file_ids = []
+    seen = set()
+    for raw_file_id in raw_file_ids:
+        if not isinstance(raw_file_id, str):
+            continue
+        file_id = raw_file_id.strip()
+        if file_id and file_id not in seen:
+            seen.add(file_id)
+            file_ids.append(file_id)
+    return file_ids
+
+
+def _uploaded_file_ref(file_record: UploadedFile) -> dict[str, Any]:
+    """Build a websocket file ref from an authorized UploadedFile record."""
+    return {
+        "file_id": str(file_record.file_id),
+        "name": str(file_record.filename),
+        "size": int(file_record.file_size or 0),
+        "type": file_record.mime_type,
+    }
+
+
+def _selected_file_refs_from_task(task: Any, db: Session) -> list[dict[str, Any]]:
+    """Recover task-selected file refs after revalidating DB ownership/binding."""
+    selected_file_ids = _selected_file_ids_from_task_config(task)
+    if not selected_file_ids:
+        return []
+
+    task_id = getattr(task, "id", None)
+    task_owner_id = getattr(task, "user_id", None)
+    if task_id is None or task_owner_id is None:
+        logger.warning("Cannot recover selected files without task id and owner id")
+        return []
+
+    task_id_int = int(task_id)
+    task_owner_id_int = int(task_owner_id)
+    records = (
+        db.query(UploadedFile)
+        .filter(
+            UploadedFile.file_id.in_(selected_file_ids),
+            UploadedFile.user_id == task_owner_id_int,
+            or_(UploadedFile.task_id == task_id_int, UploadedFile.task_id.is_(None)),
+        )
+        .all()
+    )
+    records_by_file_id = {str(record.file_id): record for record in records}
+
+    refs: list[dict[str, Any]] = []
+    for file_id in selected_file_ids:
+        record = records_by_file_id.get(file_id)
+        if record is None:
+            logger.warning(
+                "Skipping selected file %s for task %s: not found, wrong owner, "
+                "or bound to another task",
+                file_id,
+                task_id_int,
+            )
+            continue
+        refs.append(_uploaded_file_ref(record))
+    return refs
 
 
 def create_stream_event(
@@ -695,6 +777,7 @@ async def execute_task_background(
     task: Any,
     db: Session,
     force_fresh_execution: bool = False,
+    llm_user_message: Optional[str] = None,
 ) -> None:
     """Execute task in background without blocking WebSocket message loop"""
     from ..models.task import Task, TaskStatus
@@ -721,9 +804,10 @@ async def execute_task_background(
 
             # Execute task with automatic token tracking
             actual_task_id = None if force_fresh_execution else str(task_id)
+            task_for_agent = llm_user_message or user_message
             result = await agent_manager.execute_task(
                 agent_service=agent_service,
-                task=user_message,
+                task=task_for_agent,
                 context=context,
                 task_id=actual_task_id,
                 tracking_task_id=str(task_id),
@@ -1491,7 +1575,11 @@ manager = ConnectionManager()
 
 
 async def handle_file_upload_for_task(
-    task_id: int, files: list, db: Session, user: Optional[User] = None
+    task_id: int,
+    files: list,
+    db: Session,
+    user: Optional[User] = None,
+    task_owner_id: Optional[int] = None,
 ) -> dict:
     """Handle file upload for task"""
     try:
@@ -1504,6 +1592,16 @@ async def handle_file_upload_for_task(
         file_info_list = []
 
         logger.info(f"📁 Starting file upload for task {task_id}, files: {len(files)}")
+
+        authorized_owner_id = task_owner_id
+        if authorized_owner_id is None and user is not None:
+            authorized_owner_id = int(user.id)
+        if authorized_owner_id is None:
+            logger.warning(
+                "Cannot handle uploaded files for task %s without an authorized owner",
+                task_id,
+            )
+            return {"uploaded_files": [], "file_info_list": []}
 
         # Get agent
         agent_service = await get_agent_manager().get_agent_for_task(
@@ -1518,10 +1616,23 @@ async def handle_file_upload_for_task(
                 continue
 
             file_record = (
-                db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+                db.query(UploadedFile)
+                .filter(
+                    UploadedFile.file_id == file_id,
+                    UploadedFile.user_id == int(authorized_owner_id),
+                    or_(
+                        UploadedFile.task_id == int(task_id),
+                        UploadedFile.task_id.is_(None),
+                    ),
+                )
+                .first()
             )
             if not file_record:
-                logger.warning(f"File record not found for file_id: {file_id}")
+                logger.warning(
+                    "File record not accessible for task %s: %s",
+                    task_id,
+                    file_id,
+                )
                 continue
 
             file_name = file_record.filename
@@ -1726,11 +1837,7 @@ async def handle_chat_message(
         logger.info(f"Received chat message for task {task_id}")
         logger.info(f"👤 User: {user.id if user else 'unknown'}")
         logger.info(f"📄 Message: {user_message}")
-        logger.info(f"📁 Files received: {len(files)}")
-        for i, file_info in enumerate(files):
-            logger.info(
-                f"📄 File {i}: {file_info.get('name', 'unknown')} ({file_info.get('size', 0)} bytes)"
-            )
+        logger.info(f"📁 Files received from websocket/fallback: {len(files)}")
 
         # Call Agent to handle - use same agent manager as chat API
         try:
@@ -1870,6 +1977,20 @@ async def handle_chat_message(
                         await manager.broadcast_to_task(task_event, task_id)
                         logger.info(f"task_info event sent for task {task_id}")
 
+                if not files and task.status == TaskStatus.PENDING:
+                    files = _selected_file_refs_from_task(task, db)
+                    if files:
+                        logger.info(
+                            f"📁 Recovered {len(files)} selected file(s) from task "
+                            f"{task_id} for initial chat turn"
+                        )
+
+                logger.info(f"📁 Files used for execution: {len(files)}")
+                for i, file_info in enumerate(files):
+                    logger.info(
+                        f"📄 File {i}: {file_info.get('name', 'unknown')} ({file_info.get('size', 0)} bytes)"
+                    )
+
                 # Handle file upload if files present
                 uploaded_file_paths = []
                 file_info_list = []
@@ -1877,7 +1998,11 @@ async def handle_chat_message(
                 if files:
                     # Process file upload
                     upload_result = await handle_file_upload_for_task(
-                        task_id, files, db, user
+                        task_id,
+                        files,
+                        db,
+                        user,
+                        task_owner_id=int(task.user_id),
                     )
                     uploaded_file_paths = upload_result.get("uploaded_files", [])
                     file_info_list = upload_result.get("file_info_list", [])
@@ -1947,6 +2072,10 @@ async def handle_chat_message(
                     user_message,
                     uploaded_files_context,
                 )
+                display_user_message = _display_message_for_user(
+                    user_message,
+                    bool(file_info_list),
+                )
 
                 # DAG plan-execute will automatically send user_message trace event
 
@@ -1963,7 +2092,7 @@ async def handle_chat_message(
                     db,
                     task_id=task_id,
                     user_id=int(user.id),
-                    content=user_message_for_llm,
+                    content=display_user_message,
                 )
 
                 # Check if there's an old task running (PAUSED, WAITING_FOR_USER, or RUNNING status)
@@ -2006,7 +2135,7 @@ async def handle_chat_message(
                         await trace_user_message(
                             dag_pattern.tracer,
                             str(dag_pattern.task_id),
-                            user_message,
+                            display_user_message,
                             trace_data,
                         )
 
@@ -2200,6 +2329,7 @@ async def handle_chat_message(
                         logger.info(f"task_info event sent for existing task {task_id}")
 
                     # Build context with vibe mode information if available
+                    context["display_user_message"] = display_user_message
                     if hasattr(task, "execution_mode") and task.execution_mode:
                         context["execution_mode"] = task.execution_mode
                     if (
@@ -2222,13 +2352,14 @@ async def handle_chat_message(
                     bg_task = asyncio.create_task(
                         execute_task_background(
                             task_id=task_id,
-                            user_message=user_message,
+                            user_message=display_user_message,
                             context=context,
                             agent_manager=get_agent_manager(),
                             user=user,
                             task=task,
                             db=db,
                             force_fresh_execution=force_fresh_execution,
+                            llm_user_message=user_message_for_llm,
                         )
                     )
 
