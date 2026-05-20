@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from ......config import get_web_crawl_tls_impersonate
 from .web_url_utils import validate_and_normalize_web_url
 
 # Default configurable values (avoid scattering literals)
@@ -1748,10 +1749,11 @@ class WebCrawlConfig(BaseModel):
         ),
     )
     tls_impersonate: Optional[str] = Field(
-        default=None,
+        default_factory=get_web_crawl_tls_impersonate,
         description=(
             "TLS fingerprint to impersonate via curl_cffi. "
-            "Defaults to None (plain httpx -- fastest, but no WAF bypass). "
+            "Defaults to XAGENT_WEB_CRAWL_TLS_IMPERSONATE when set, otherwise "
+            "None (plain httpx -- fastest, but no WAF bypass). "
             "Pass 'auto' to try a built-in fallback chain in order until one "
             "succeeds. "
             "Pass a specific impersonate spec (e.g. 'safari17_0', 'chrome120') "

@@ -26,6 +26,7 @@ from xagent.config import (
     SANDBOX_VOLUMES,
     STORAGE_ROOT,
     UPLOADS_DIR,
+    WEB_CRAWL_TLS_IMPERSONATE,
     WEB_DIR,
     WEB_SEARCH_PROVIDER,
     format_file_size,
@@ -51,6 +52,7 @@ from xagent.config import (
     get_sandbox_volumes,
     get_storage_root,
     get_uploads_dir,
+    get_web_crawl_tls_impersonate,
     get_web_dir,
     get_web_search_provider,
 )
@@ -92,6 +94,9 @@ class TestEnvironmentVariableConstants:
     def test_web_search_provider_constant(self):
         assert WEB_SEARCH_PROVIDER == "XAGENT_WEB_SEARCH_PROVIDER"
 
+    def test_web_crawl_tls_impersonate_constant(self):
+        assert WEB_CRAWL_TLS_IMPERSONATE == "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
+
     def test_file_storage_uri_constant(self):
         assert FILE_STORAGE_URI == "XAGENT_FILE_STORAGE_URI"
 
@@ -122,6 +127,27 @@ class TestGetWebSearchProvider:
     def test_invalid_web_search_provider_falls_back_to_auto(self, monkeypatch):
         monkeypatch.setenv(WEB_SEARCH_PROVIDER, "bing")
         assert get_web_search_provider() == "auto"
+
+
+class TestGetWebCrawlTlsImpersonate:
+    """Test get_web_crawl_tls_impersonate() function."""
+
+    def test_default_web_crawl_tls_impersonate(self, monkeypatch):
+        monkeypatch.delenv(WEB_CRAWL_TLS_IMPERSONATE, raising=False)
+        assert get_web_crawl_tls_impersonate() is None
+
+    @pytest.mark.parametrize("value", ["", "   ", "none", "None", "NULL"])
+    def test_empty_like_web_crawl_tls_impersonate(self, monkeypatch, value):
+        monkeypatch.setenv(WEB_CRAWL_TLS_IMPERSONATE, value)
+        assert get_web_crawl_tls_impersonate() is None
+
+    def test_auto_web_crawl_tls_impersonate(self, monkeypatch):
+        monkeypatch.setenv(WEB_CRAWL_TLS_IMPERSONATE, " auto ")
+        assert get_web_crawl_tls_impersonate() == "auto"
+
+    def test_specific_web_crawl_tls_impersonate(self, monkeypatch):
+        monkeypatch.setenv(WEB_CRAWL_TLS_IMPERSONATE, "safari17_0")
+        assert get_web_crawl_tls_impersonate() == "safari17_0"
 
 
 class TestGetMaxUploadSizeBytes:
