@@ -31,7 +31,7 @@ from ...config import (
     get_external_upload_dirs,
     get_uploads_dir,
 )
-from ...core.agent.trace import TraceEvent, TraceHandler
+from ...core.agent.trace import TraceEvent, TraceHandler, trace_user_message
 from ...core.file_ref import FILE_REF_MODEL_INSTRUCTIONS, build_file_ref
 from ..auth_dependencies import get_user_from_websocket_token
 from ..models.database import get_db
@@ -204,6 +204,29 @@ def _display_message_for_user(user_message: str, has_files: bool) -> str:
     if has_files:
         return "Uploaded file(s)"
     return user_message
+
+
+def _display_file_refs_from_file_info(
+    file_info_list: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return display-safe file refs without runtime paths."""
+    refs: list[dict[str, Any]] = []
+    for file_info in file_info_list:
+        file_id = str(file_info.get("file_id") or "").strip()
+        if not file_id:
+            continue
+        ref: dict[str, Any] = {"file_id": file_id}
+        name = file_info.get("name") or file_info.get("original_name")
+        if name is not None:
+            ref["name"] = str(name)
+        size = file_info.get("size")
+        if size is not None:
+            ref["size"] = size
+        file_type = file_info.get("type")
+        if file_type is not None:
+            ref["type"] = str(file_type)
+        refs.append(ref)
+    return refs
 
 
 def _selected_file_ids_from_task_config(task: Any) -> list[str]:
@@ -2056,6 +2079,9 @@ async def handle_chat_message(
                     user_message,
                     bool(file_info_list),
                 )
+                display_file_refs = _display_file_refs_from_file_info(file_info_list)
+                context["display_message"] = display_user_message
+                context["files"] = display_file_refs
 
                 # DAG plan-execute will automatically send user_message trace event
 
@@ -2104,12 +2130,11 @@ async def handle_chat_message(
                     if hasattr(dag_pattern, "tracer") and hasattr(
                         dag_pattern, "task_id"
                     ):
-                        from ...core.agent.trace import trace_user_message
-
                         trace_data = {
                             "context": context,
                             "pattern": "DAG Plan-Execute Continuation",
                             "continuation": "true",
+                            "files": display_file_refs,
                         }
                         await trace_user_message(
                             dag_pattern.tracer,
@@ -2179,13 +2204,27 @@ async def handle_chat_message(
                     assert agent_service is not None
                     posted = await agent_service.post_user_message(
                         str(task_id),
-                        user_message_for_llm,
+                        execution_message=user_message_for_llm,
+                        display_message=display_user_message,
+                        files=display_file_refs,
                         request_interrupt=task.status == TaskStatus.RUNNING,
                         reason="new websocket user message",
                     )
                     if not posted:
                         logger.warning(
                             f"agent execution {task_id} was not live; attempting resume from checkpoint"
+                        )
+                    else:
+                        await trace_user_message(
+                            agent_service.tracer,
+                            str(task_id),
+                            display_user_message,
+                            {
+                                "context": context,
+                                "pattern": "Agent Live Control",
+                                "continuation": "true",
+                                "files": display_file_refs,
+                            },
                         )
 
                     previous_task = background_task_manager.running_tasks.get(task_id)
@@ -2280,7 +2319,6 @@ async def handle_chat_message(
                         logger.info(f"task_info event sent for existing task {task_id}")
 
                     # Build context with vibe mode information if available
-                    context["display_user_message"] = display_user_message
                     if hasattr(task, "execution_mode") and task.execution_mode:
                         context["execution_mode"] = task.execution_mode
                     if (
