@@ -76,6 +76,8 @@ interface VersionInfo {
   is_latest?: boolean | null
 }
 
+const TASKS_PER_PAGE = 10
+
 function formatStars(stars: number): string {
   if (stars >= 1000000) return `${(stars / 1000000).toFixed(1)}M`
   if (stars >= 1000) return `${(stars / 1000).toFixed(1)}k`
@@ -389,7 +391,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
   const [isLoadingMore, setIsLoadingMore] = useState(false)
   const navRef = useRef<HTMLElement | null>(null)
   const pathnameRef = useRef(pathname)
-  pathnameRef.current = pathname // Synchronous update during render
+  const pageRef = useRef(page)
   const displayVersion = versionInfo?.display_version || "unknown"
 
   // Search state
@@ -405,6 +407,14 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
   // Loading state ref for polling interval
   const loadingRef = useRef({ isLoadingTasks, isLoadingMore })
   loadingRef.current = { isLoadingTasks, isLoadingMore }
+
+  useEffect(() => {
+    pathnameRef.current = pathname
+  }, [pathname])
+
+  useEffect(() => {
+    pageRef.current = page
+  }, [page])
 
   useEffect(() => {
     let isCancelled = false
@@ -501,7 +511,7 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
 
     try {
       const searchParam = searchRef.current ? `&search=${encodeURIComponent(searchRef.current)}` : ''
-      const response = await apiRequest(`${getApiUrl()}/api/chat/tasks?page=${pageNum}&per_page=10${searchParam}`)
+      const response = await apiRequest(`${getApiUrl()}/api/chat/tasks?page=${pageNum}&per_page=${TASKS_PER_PAGE}${searchParam}`)
       if (response.ok) {
         const data = await response.json()
         // Handle new API response format {tasks: [...], pagination: {...}}
@@ -533,18 +543,19 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
           })
         }
 
+        const totalPages = data.pagination?.total_pages || 1
+        const loadedPage = isPolling ? Math.min(pageRef.current, totalPages) : pageNum
+
         if (isPolling) {
           setTasks(prev => {
-            const prevIds = new Set(prev.map(t => String(t.task_id)))
-            const completelyNewTasks = newTasks.filter((t: Task) => !prevIds.has(String(t.task_id)))
+            const newTaskIds = new Set(newTasks.map((t: Task) => String(t.task_id)))
+            const remainingTasks = prev
+              .slice(Math.min(TASKS_PER_PAGE, prev.length))
+              .filter(t => !newTaskIds.has(String(t.task_id)))
 
-            const newTasksMap = new Map(newTasks.map((t: Task) => [String(t.task_id), t]))
-            const updatedTasks = prev.map(t => {
-              const updated = newTasksMap.get(String(t.task_id))
-              return updated ? { ...t, ...updated } : t
-            })
-
-            return [...completelyNewTasks, ...updatedTasks]
+            // Polling only refreshes page 1, so replace that slice and trim retained pages
+            // to the current loaded page when the server reports fewer total pages.
+            return [...newTasks, ...remainingTasks].slice(0, loadedPage * TASKS_PER_PAGE)
           })
         } else if (isAppending) {
           setTasks(prev => [...prev, ...newTasks])
@@ -553,9 +564,17 @@ export function Sidebar({ className, allowCollapse = true }: SidebarProps) {
         }
 
         // Update pagination status
-        const totalPages = data.pagination?.total_pages || 1
-        setHasMore(pageNum < totalPages)
-        setPage(pageNum)
+        if (isPolling) {
+          // Polling always refreshes page 1, so keep the user's loaded page state intact.
+          setHasMore(loadedPage < totalPages)
+
+          if (loadedPage !== pageRef.current) {
+            setPage(loadedPage)
+          }
+        } else {
+          setHasMore(pageNum < totalPages)
+          setPage(pageNum)
+        }
       }
     } catch (error) {
       console.error('Failed to load tasks:', error)
