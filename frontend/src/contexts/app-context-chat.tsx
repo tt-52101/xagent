@@ -40,6 +40,13 @@ import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLO
 import { useI18n } from "@/contexts/i18n-context"
 import { normalizeTimestampMs } from "@/lib/time-utils"
 import { unwrapFinalAnswerContent } from "@/lib/final-answer"
+import {
+  getFinalAnswerStreamActionPayload,
+  getFinalAnswerStreamMessageId,
+  isFinalAnswerStreamEventType,
+  isStreamingFinalAnswerMessage,
+  mergeTraceEventsById,
+} from "@/lib/streaming-final-answer"
 
 // Unique ID generator for messages
 let messageIdCounter = 0
@@ -303,6 +310,7 @@ interface Message {
   status?: "pending" | "running" | "completed" | "failed"
   isResult?: boolean
   isFileOutput?: boolean
+  streamMessageId?: string
   traceEvents?: TraceEvent[]
   interactions?: Interaction[]
 }
@@ -452,6 +460,7 @@ interface AppState {
 type AppAction =
   | { type: "SET_TASK_ID"; payload: number | null }
   | { type: "ADD_MESSAGE"; payload: Message }
+  | { type: "UPSERT_STREAMING_FINAL_ANSWER"; payload: { messageId: string; delta?: string; content?: string; status?: Message["status"]; timestamp: string } }
   | { type: "SET_CURRENT_TASK"; payload: Task }
   | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: Interaction[] } }
   | { type: "TRIGGER_TASK_UPDATE" }
@@ -553,9 +562,36 @@ function appReducer(state: AppState, action: AppAction): AppState {
       if (newMessage.role === "assistant" && newMessage.isResult) {
         messageToAdd = {
           ...newMessage,
-          traceEvents: [...state.traceEvents]
+          traceEvents: mergeTraceEventsById(newMessage.traceEvents, state.traceEvents)
         }
         newTraceEvents = []
+      }
+
+      if (newMessage.role === "assistant" && newMessage.isResult) {
+        const replaceMessageAt = (targetIndex: number) => {
+          const updatedMessages = state.messages.map((message, index) =>
+            index === targetIndex
+              ? {
+                  ...message,
+                  ...messageToAdd,
+                  id: message.id,
+                  status: newMessage.status || "completed",
+                  traceEvents: mergeTraceEventsById(message.traceEvents, messageToAdd.traceEvents),
+                }
+              : message
+          )
+          return { ...state, messages: updatedMessages, traceEvents: newTraceEvents }
+        }
+        if (newMessage.streamMessageId) {
+          const streamingIndex = state.messages.findIndex(
+            message =>
+              message.id === newMessage.streamMessageId &&
+              isStreamingFinalAnswerMessage(message)
+          )
+          if (streamingIndex >= 0) {
+            return replaceMessageAt(streamingIndex)
+          }
+        }
       }
 
       const updatedMessages = [...state.messages, messageToAdd]
@@ -563,6 +599,39 @@ function appReducer(state: AppState, action: AppAction): AppState {
         return normalizeTimestampMs(a.timestamp) - normalizeTimestampMs(b.timestamp)
       })
       return { ...state, messages: updatedMessages, traceEvents: newTraceEvents }
+    }
+
+    case "UPSERT_STREAMING_FINAL_ANSWER": {
+      const { messageId, delta, content, status, timestamp } = action.payload
+      const existing = state.messages.find(message => message.id === messageId)
+      if (!existing) {
+        const message: Message = {
+          id: messageId,
+          role: "assistant",
+          content: content || delta || "",
+          rawContent: content || delta || "",
+          timestamp,
+          status: status || "running",
+          isResult: true,
+          traceEvents: [...state.traceEvents],
+        }
+        return { ...state, messages: [...state.messages, message], traceEvents: [] }
+      }
+      const updatedMessages = state.messages.map(message => {
+        if (message.id !== messageId) {
+          return message
+        }
+        const currentContent =
+          typeof message.content === "string" ? message.content : ""
+        const nextContent = content !== undefined ? content : currentContent + (delta || "")
+        return {
+          ...message,
+          content: nextContent,
+          rawContent: nextContent,
+          status: status || message.status || "running",
+        }
+      })
+      return { ...state, messages: updatedMessages }
     }
 
     case "SET_CURRENT_TASK":
@@ -1058,6 +1127,23 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
     }
 
     // Normal message processing when not in replay mode
+    if (isFinalAnswerStreamEventType(message.type)) {
+      const payload = getFinalAnswerStreamActionPayload({
+        eventType: message.type,
+        eventData: message,
+        eventId: message.event_id,
+        timestamp: message.timestamp,
+        fallbackMessageId: generateMessageId("msg-final-answer"),
+      })
+      if (payload) {
+        dispatch({ type: "UPSERT_STREAMING_FINAL_ANSWER", payload })
+        if (message.type === "final_answer_start") {
+          dispatch({ type: "SET_PROCESSING", payload: true })
+        }
+      }
+      return
+    }
+
     switch (message.type) {
       case "chat":
         const chatData = message as any
@@ -1275,6 +1361,23 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             console.log('✅ User message dispatched successfully')
           }
 
+          else if (isFinalAnswerStreamEventType(eventType)) {
+            const payload = getFinalAnswerStreamActionPayload({
+              eventType,
+              eventData,
+              eventId: message.event_id,
+              timestamp: message.timestamp,
+              fallbackMessageId: generateMessageId("msg-final-answer"),
+            })
+            if (!payload) {
+              return
+            }
+            dispatch({ type: "UPSERT_STREAMING_FINAL_ANSWER", payload })
+            if (eventType === "final_answer_start") {
+              dispatch({ type: "SET_PROCESSING", payload: true })
+            }
+          }
+
           // Agent-to-user messages, including ask_user_question prompts.
           else if (eventType === "agent_message" || eventType === "ai_message") {
             const rawMessageContent = eventData.message || eventData.content || ""
@@ -1300,7 +1403,11 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                 }
               })
             }
-            if (isDuplicateMessage(messageContent, 'agent-message')) {
+            const streamMessageId =
+              eventType === "ai_message"
+                ? getFinalAnswerStreamMessageId(eventData)
+                : undefined
+            if (!streamMessageId && isDuplicateMessage(messageContent, 'agent-message')) {
               return
             }
             const msgId = generateMessageId("msg-agent")
@@ -1314,6 +1421,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                 timestamp: message.timestamp,
                 status: eventData.status === "completed" ? "completed" : "running",
                 isResult: true,
+                streamMessageId,
                 interactions: interactions.length > 0 ? interactions : undefined,
               }
             })
@@ -2231,6 +2339,8 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             delete (metaInfo as any).content
             delete (metaInfo as any).file_outputs
             delete (metaInfo as any).history
+            delete (metaInfo as any).stream_message_id
+            delete (metaInfo as any).streamMessageId
             const hasMetaInfo = Object.keys(metaInfo).length > 0 && metaInfo !== null && metaInfo !== undefined
 
             // 1.5. Extract step data from history and update state.steps

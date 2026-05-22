@@ -23,6 +23,12 @@ import { getApiUrl, getUploadApiUrl } from "@/lib/utils"
 import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
 import { unwrapFinalAnswerContent } from "@/lib/final-answer"
+import {
+  getFinalAnswerStreamActionPayload,
+  getFinalAnswerStreamMessageId,
+  isFinalAnswerStreamEventType,
+  isStreamingFinalAnswerMessage,
+} from "@/lib/streaming-final-answer"
 
 // Unique ID generator for messages
 let messageIdCounter = 0
@@ -140,6 +146,7 @@ interface Message {
   status?: "pending" | "running" | "completed" | "failed"
   isResult?: boolean
   isFileOutput?: boolean
+  streamMessageId?: string
   interactions?: unknown[]
 }
 
@@ -282,6 +289,7 @@ interface AppState {
 type AppAction =
   | { type: "SET_TASK_ID"; payload: number | null }
   | { type: "ADD_MESSAGE"; payload: Message }
+  | { type: "UPSERT_STREAMING_FINAL_ANSWER"; payload: { messageId: string; delta?: string; content?: string; status?: Message["status"]; timestamp: string } }
   | { type: "SET_CURRENT_TASK"; payload: Task }
   | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: unknown[] } }
   | { type: "SET_DAG_EXECUTION"; payload: DAGExecution | null }
@@ -356,6 +364,31 @@ function appReducer(state: AppState, action: AppAction): AppState {
 
     case "ADD_MESSAGE":
       const newMessage = action.payload
+      if (newMessage.role === "assistant" && newMessage.isResult) {
+        const replaceMessageAt = (targetIndex: number) => ({
+          ...state,
+          messages: state.messages.map((message, index) =>
+            index === targetIndex
+              ? {
+                  ...message,
+                  ...newMessage,
+                  id: message.id,
+                  status: newMessage.status || "completed",
+                }
+              : message
+          ),
+        })
+        if (newMessage.streamMessageId) {
+          const streamingIndex = state.messages.findIndex(
+            message =>
+              message.id === newMessage.streamMessageId &&
+              isStreamingFinalAnswerMessage(message)
+          )
+          if (streamingIndex >= 0) {
+            return replaceMessageAt(streamingIndex)
+          }
+        }
+      }
       const updatedMessages = [...state.messages, newMessage]
       // Sort messages by timestamp
       updatedMessages.sort((a, b) => {
@@ -364,6 +397,43 @@ function appReducer(state: AppState, action: AppAction): AppState {
         return timeA - timeB
       })
       return { ...state, messages: updatedMessages }
+
+    case "UPSERT_STREAMING_FINAL_ANSWER": {
+      const { messageId, delta, content, status, timestamp } = action.payload
+      const existing = state.messages.find(message => message.id === messageId)
+      if (!existing) {
+        return {
+          ...state,
+          messages: [
+            ...state.messages,
+            {
+              id: messageId,
+              role: "assistant",
+              content: content || delta || "",
+              timestamp,
+              status: status || "running",
+              isResult: true,
+            },
+          ],
+        }
+      }
+      return {
+        ...state,
+        messages: state.messages.map(message => {
+          if (message.id !== messageId) {
+            return message
+          }
+          const currentContent =
+            typeof message.content === "string" ? message.content : ""
+          const nextContent = content !== undefined ? content : currentContent + (delta || "")
+          return {
+            ...message,
+            content: nextContent,
+            status: status || message.status || "running",
+          }
+        }),
+      }
+    }
 
     case "SET_CURRENT_TASK":
       return { ...state, currentTask: action.payload }
@@ -753,6 +823,23 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
     }
 
     // Normal message processing when not in replay mode
+    if (isFinalAnswerStreamEventType(message.type)) {
+      const payload = getFinalAnswerStreamActionPayload({
+        eventType: message.type,
+        eventData: message,
+        eventId: message.event_id,
+        timestamp: message.timestamp,
+        fallbackMessageId: generateMessageId("msg-final-answer"),
+      })
+      if (payload) {
+        dispatch({ type: "UPSERT_STREAMING_FINAL_ANSWER", payload })
+        if (message.type === "final_answer_start") {
+          dispatch({ type: "SET_PROCESSING", payload: true })
+        }
+      }
+      return
+    }
+
     switch (message.type) {
       case "trace_event":
         const traceEventData = message.data as any
@@ -895,6 +982,23 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             })
 
             console.log('✅ User message dispatched successfully')
+          }
+
+          else if (isFinalAnswerStreamEventType(eventType)) {
+            const payload = getFinalAnswerStreamActionPayload({
+              eventType,
+              eventData,
+              eventId: message.event_id,
+              timestamp: message.timestamp,
+              fallbackMessageId: generateMessageId("msg-final-answer"),
+            })
+            if (!payload) {
+              return
+            }
+            dispatch({ type: "UPSERT_STREAMING_FINAL_ANSWER", payload })
+            if (eventType === "final_answer_start") {
+              dispatch({ type: "SET_PROCESSING", payload: true })
+            }
           }
 
           // Agent-to-user messages, including ask_user_question prompts.
@@ -1752,6 +1856,8 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             delete (metaInfo as any).content
             delete (metaInfo as any).file_outputs
             delete (metaInfo as any).history
+            delete (metaInfo as any).stream_message_id
+            delete (metaInfo as any).streamMessageId
             const hasMetaInfo = Object.keys(metaInfo).length > 0 && metaInfo !== null && metaInfo !== undefined
 
             // 1.5. Extract step data from history and update state.steps
@@ -1958,6 +2064,10 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             // 3. Output execution result
             const finalOutput = (resultData as any).output
             if (finalOutput && finalOutput.trim() !== '') {
+              const streamMessageId = getFinalAnswerStreamMessageId({
+                ...eventData,
+                result: resultData,
+              })
               const resultContent = (
                 <div className="space-y-2">
                   <div className="flex items-center gap-2 text-sm text-blue-400">
@@ -1979,6 +2089,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                     timestamp: message.timestamp,
                     status: success ? "completed" : "failed",
                     isResult: true,
+                    streamMessageId,
                   }
                 })
               }
@@ -2081,6 +2192,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
 
           // AI Message Events
           else if (eventType === "ai_message") {
+            const streamMessageId = getFinalAnswerStreamMessageId(eventData)
             dispatch({
               type: "ADD_MESSAGE",
               payload: {
@@ -2092,6 +2204,8 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                     : eventData.content || "",
                 timestamp: message.timestamp,
                 status: "completed",
+                isResult: true,
+                streamMessageId,
               }
             })
           }
