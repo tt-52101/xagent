@@ -19,6 +19,7 @@ from .models import (
     KBStorageBackend,
     KBUserScope,
 )
+from .storage_shim import KBStorageShimCompatibilityFacade
 
 T = TypeVar("T")
 
@@ -30,19 +31,28 @@ class KBCoordinator:
 
     def __init__(
         self,
-        storage_factory: Optional[StorageFactory] = None,
-        handle_provider: Optional[KBHandleProvider] = None,
+        storage_factory: StorageFactory | None = None,
+        handle_provider: KBHandleProvider | None = None,
+        storage_shim: KBStorageShimCompatibilityFacade | None = None,
     ) -> None:
         self._storage_factory = storage_factory or StorageFactory.get_factory()
         self._handle_provider = handle_provider or KBHandleProvider()
+        self._storage_shim = storage_shim or KBStorageShimCompatibilityFacade(
+            storage_factory=self._storage_factory
+        )
+
+    @property
+    def storage_shim(self) -> KBStorageShimCompatibilityFacade:
+        """Return the low-level storage compatibility facade."""
+        return self._storage_shim
 
     async def get_context(self, request: KBContextRequest) -> KBCollectionContext:
         """Resolve collection, caller scope, stores, backend, and capabilities."""
         collection = self._normalize_collection(request.collection)
         access_mode = self._normalize_access_mode(request.access_mode)
         user_scope = self._resolve_user_scope(request)
-        metadata_store = self._storage_factory.get_metadata_store()
-        vector_index_store = self._storage_factory.get_vector_index_store()
+        metadata_store = self._storage_shim.get_metadata_store()
+        vector_index_store = self._storage_shim.get_vector_index_store()
 
         collection_info = None
         try:
@@ -157,6 +167,11 @@ class KBCoordinator:
             return KBBackendCapabilities.lancedb()
         return KBBackendCapabilities.unsupported()
 
+    def reset_compatibility_caches(self) -> None:
+        """Clear coordinator-owned compatibility facade caches."""
+        self._storage_shim.reset_coordinator_caches()
+        self._handle_provider.reset_for_tests()
+
 
 _coordinator_lock = threading.RLock()
 _coordinator: Optional[KBCoordinator] = None
@@ -176,6 +191,8 @@ def reset_kb_coordinator_for_tests() -> None:
     """Reset process-global KB coordinator state for tests."""
     global _coordinator
     with _coordinator_lock:
+        if _coordinator is not None:
+            _coordinator.reset_compatibility_caches()
         _coordinator = None
 
 
