@@ -239,7 +239,6 @@ describe("workforce frontend core components", () => {
 
     render(
       <WorkforcePromptCreator
-        onManualSetup={vi.fn()}
         onCreated={onCreated}
       />,
     )
@@ -417,7 +416,7 @@ describe("workforce frontend core components", () => {
 
     render(<WorkforceWizard onCreated={onCreated} />)
 
-    await screen.findByText("workforces.create.manual.title")
+    await screen.findByRole("region", { name: "Progress Stepper" })
 
     fireEvent.change(screen.getByPlaceholderText("workforces.create.placeholders.name"), {
       target: { value: "Launch Workforce" },
@@ -488,7 +487,7 @@ describe("workforce frontend core components", () => {
 
     render(<WorkforceWizard onCreated={vi.fn()} />)
 
-    await screen.findByText("workforces.create.manual.title")
+    await screen.findByRole("region", { name: "Progress Stepper" })
 
     fireEvent.change(screen.getByPlaceholderText("workforces.create.placeholders.name"), {
       target: { value: "Launch Workforce" },
